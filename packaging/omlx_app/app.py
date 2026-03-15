@@ -5,6 +5,7 @@ A native macOS menubar app for managing the oMLX LLM inference server.
 """
 
 import logging
+import platform
 import time
 import webbrowser
 from pathlib import Path
@@ -38,6 +39,32 @@ from .server_manager import PortConflict, ServerManager, ServerStatus
 logger = logging.getLogger(__name__)
 
 
+def _find_matching_dmg(assets: list[dict]) -> str | None:
+    """Select the DMG asset matching the current macOS version.
+
+    DMG filenames follow the pattern: oMLX-0.2.10-macos15-sequoia_260210.dmg
+    Matches 'macosNN' from filename against the running OS major version.
+    Falls back to the single DMG if only one is available.
+    """
+    mac_ver = platform.mac_ver()[0]  # e.g., "15.3.1" or "26.0"
+    os_major = mac_ver.split(".")[0]  # e.g., "15" or "26"
+    os_tag = f"macos{os_major}"  # e.g., "macos15" or "macos26"
+
+    dmg_assets = [a for a in assets if a.get("name", "").endswith(".dmg")]
+
+    # Exact OS match
+    for asset in dmg_assets:
+        name = asset["name"]
+        if f"-{os_tag}-" in name or f"-{os_tag}_" in name:
+            return asset["browser_download_url"]
+
+    # Fallback: single DMG release (no platform tag or only one DMG)
+    if len(dmg_assets) == 1:
+        return dmg_assets[0]["browser_download_url"]
+
+    return None
+
+
 class OMLXAppDelegate(NSObject):
     """Main application delegate for oMLX menubar app."""
 
@@ -61,7 +88,6 @@ class OMLXAppDelegate(NSObject):
         self._update_info: Optional[dict] = None
         self._last_update_check: float = 0
         self._updater = None  # AppUpdater instance during download
-        self._update_ready = False  # True when staged app is ready to swap
         self._update_progress_text = ""  # Current download progress text
 
         return self
@@ -253,12 +279,8 @@ class OMLXAppDelegate(NSObject):
                 current = __version__
 
                 if self._is_newer_version(latest, current):
-                    # Find DMG asset URL for auto-update
-                    dmg_url = None
-                    for asset in data.get("assets", []):
-                        if asset.get("name", "").endswith(".dmg"):
-                            dmg_url = asset["browser_download_url"]
-                            break
+                    # Find DMG asset matching current macOS version
+                    dmg_url = _find_matching_dmg(data.get("assets", []))
 
                     self._update_info = {
                         "version": latest,
@@ -267,6 +289,7 @@ class OMLXAppDelegate(NSObject):
                         "notes": data.get("body", ""),
                     }
                     logger.info(f"Update available: {latest}")
+                    self._build_menu()
                 else:
                     self._update_info = None
             else:
@@ -402,29 +425,10 @@ class OMLXAppDelegate(NSObject):
         )
 
     def updateReadyOnMain_(self, _):
-        """Main thread: show 'Restart to Update' in menu."""
-        self._update_ready = True
+        """Main thread: download complete, auto-install and relaunch."""
         self._updater = None
-        self._update_progress_text = ""
+        self._update_progress_text = "Installing update..."
         self._build_menu()
-
-    @objc.IBAction
-    def installUpdate_(self, sender):
-        """User clicked 'Restart to Update' - perform the swap."""
-        from AppKit import NSAlert, NSAlertFirstButtonReturn
-
-        alert = NSAlert.alloc().init()
-        alert.setMessageText_("Ready to Update")
-        alert.setInformativeText_(
-            "oMLX will quit, install the update, and relaunch.\n"
-            "The server will be stopped during the update."
-        )
-        alert.addButtonWithTitle_("Restart Now")
-        alert.addButtonWithTitle_("Later")
-
-        if alert.runModal() != NSAlertFirstButtonReturn:
-            return
-
         self._perform_update_and_relaunch()
 
     def _perform_update_and_relaunch(self):
@@ -516,12 +520,7 @@ class OMLXAppDelegate(NSObject):
         if self._update_info:
             self.menu.addItem_(NSMenuItem.separatorItem())
 
-            if self._update_ready:
-                update_text = (
-                    f"✅ Restart to Update ({self._update_info['version']})"
-                )
-                update_action = "installUpdate:"
-            elif self._updater is not None:
+            if self._updater is not None:
                 progress = self._update_progress_text or "Downloading..."
                 update_text = f"⬇️ {progress}"
                 update_action = None
@@ -970,10 +969,22 @@ class OMLXAppDelegate(NSObject):
 
         alert = NSAlert.alloc().init()
         alert.setMessageText_("About oMLX")
+
+        try:
+            from omlx._build_info import build_number
+        except ImportError:
+            build_number = None
+
+        version_text = f"Version: {__version__}"
+        if build_number:
+            version_text += f"\nBuild: {build_number}"
+
         alert.setInformativeText_(
-            "oMLX - LLM inference,\noptimized for your Mac\n\n"
+            "LLM inference,\n"
+            "optimized for your Mac\n\n"
             "Built with MLX, mlx-lm, and mlx-vlm\n"
-            f"Version: {__version__}"
+            "Special Thanks to 1212.H.\n\n"
+            f"{version_text}"
         )
         alert.addButtonWithTitle_("OK")
         alert.addButtonWithTitle_("GitHub")

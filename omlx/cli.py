@@ -51,10 +51,19 @@ def serve_command(args):
     from .settings import init_settings, get_settings
     from .logging_config import configure_file_logging
 
+    try:
+        from ._build_info import build_number
+    except ImportError:
+        build_number = None
+
     # Print version banner
     print(f"\033[33moMLX - LLM inference, optimized for your Mac\033[0m")
     print(f"\033[33m├─ https://github.com/jundot/omlx\033[0m")
-    print(f"\033[33m└─ Version: {__version__}\033[0m")
+    if build_number:
+        print(f"\033[33m├─ Version: {__version__}\033[0m")
+        print(f"\033[33m└─ Build: {build_number}\033[0m")
+    else:
+        print(f"\033[33m└─ Version: {__version__}\033[0m")
     print()
 
     # Initialize global settings first (to get log_level from file if not specified)
@@ -88,6 +97,10 @@ def serve_command(args):
     # Apply HuggingFace endpoint if configured
     if settings.huggingface.endpoint:
         os.environ["HF_ENDPOINT"] = settings.huggingface.endpoint
+
+    # Apply ModelScope endpoint if configured
+    if settings.modelscope.endpoint:
+        os.environ["MODELSCOPE_DOMAIN"] = settings.modelscope.endpoint
 
     # Save CLI args to settings.json if non-default values provided
     if _has_cli_overrides(args):
@@ -301,11 +314,31 @@ def launch_command(args):
         print(f"Install: {integration.install_hint}")
         sys.exit(1)
 
+    # Fetch model limits from server
+    context_window = None
+    max_tokens = None
+    try:
+        resp = requests.get(f"{base_url}/v1/models/status", headers=headers, timeout=5)
+        if resp.ok:
+            for m in resp.json().get("models", []):
+                if m["id"] == model:
+                    context_window = m.get("max_context_window")
+                    max_tokens = m.get("max_tokens")
+                    break
+    except Exception:
+        pass
+
     # Launch
     print(f"Launching {integration.display_name} with model {model}...")
     tools_profile = getattr(args, "tools_profile", "coding")
     integration.launch(
-        port=port, api_key=api_key, model=model, host=host, tools_profile=tools_profile
+        port=port,
+        api_key=api_key,
+        model=model,
+        host=host,
+        tools_profile=tools_profile,
+        context_window=context_window,
+        max_tokens=max_tokens,
     )
 
 
@@ -433,6 +466,14 @@ Example directory structure:
         type=str,
         default=None,
         help="Custom HuggingFace Hub endpoint URL (e.g., https://hf-mirror.com)",
+    )
+
+    # ModelScope options
+    serve_parser.add_argument(
+        "--ms-endpoint",
+        type=str,
+        default=None,
+        help="Custom ModelScope Hub endpoint URL",
     )
 
     # Base path and auth

@@ -12,6 +12,8 @@
     <!-- CJK Font (conditional, self-hosted) -->
     {% if current_lang == 'zh' %}
     <link rel="stylesheet" href="/admin/static/fonts/noto-sans-sc/noto-sans-sc.css">
+    {% elif current_lang == 'zh-TW' %}
+    <link rel="stylesheet" href="/admin/static/fonts/noto-sans-tc/noto-sans-tc.css">
     {% elif current_lang == 'ko' %}
     <link rel="stylesheet" href="/admin/static/fonts/noto-sans-kr/noto-sans-kr.css">
     {% elif current_lang == 'ja' %}
@@ -48,6 +50,8 @@
             --font-sans: 'Noto Sans KR', 'Inter', system-ui, sans-serif;
             {% elif current_lang == 'zh' %}
             --font-sans: 'Noto Sans SC', 'Inter', system-ui, sans-serif;
+            {% elif current_lang == 'zh-TW' %}
+            --font-sans: 'Noto Sans TC', 'Inter', system-ui, sans-serif;
             {% elif current_lang == 'ja' %}
             --font-sans: 'Noto Sans JP', 'Inter', system-ui, sans-serif;
             {% else %}
@@ -81,6 +85,24 @@
         input:focus, select:focus, textarea:focus {
             outline: none;
             box-shadow: 0 0 0 2px rgba(0,0,0,0.1);
+        }
+
+        /* Benchmark tooltip (fixed position, outside overflow containers) */
+        .bench-tip-fixed {
+            position: fixed;
+            z-index: 9999;
+            max-width: 320px;
+            padding: 10px 12px;
+            background: #171717;
+            color: #e5e5e5;
+            font-size: 12px;
+            font-weight: 400;
+            line-height: 1.5;
+            border-radius: 8px;
+            white-space: normal;
+            text-align: left;
+            pointer-events: none;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.15);
         }
     </style>
 

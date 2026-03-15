@@ -7,8 +7,6 @@ import pytest
 
 from omlx.api.responses_models import (
     InputItem,
-    OutputContent,
-    OutputItem,
     ResponseObject,
     ResponsesRequest,
     ResponsesTool,
@@ -18,13 +16,17 @@ from omlx.api.responses_models import (
 )
 from omlx.api.responses_utils import (
     ResponseStore,
+    ResponseStateCorruptError,
+    ResponseStateNotFoundError,
     build_function_call_output_item,
     build_message_output_item,
     build_response_usage,
+    build_response_store_record,
     convert_responses_input_to_messages,
     convert_responses_tools,
     convert_stored_response_to_messages,
     format_sse_event,
+    normalize_response_output_to_messages,
 )
 from omlx.api.shared_models import IDPrefix, generate_id
 
@@ -210,6 +212,112 @@ class TestConvertResponsesInput:
         assert messages[1]["role"] == "assistant"
         assert len(messages[1]["tool_calls"]) == 2
 
+    def test_assistant_message_merged_with_function_call(self):
+        """Assistant message followed by function_call should produce a single
+        assistant message (not two), preventing duplicate assistant turns that
+        confuse chat templates."""
+        items = [
+            InputItem(type="message", role="user", content="Do something"),
+            InputItem(
+                type="message",
+                role="assistant",
+                content=[{"type": "output_text", "text": ""}],
+            ),
+            InputItem(
+                type="function_call",
+                call_id="call_abc",
+                name="exec_command",
+                arguments='{"cmd": "ls"}',
+            ),
+            InputItem(
+                type="function_call_output",
+                call_id="call_abc",
+                output="file1.txt\nfile2.txt",
+            ),
+        ]
+        messages = convert_responses_input_to_messages(items)
+        # user, assistant (content + tool_calls merged), tool
+        assert len(messages) == 3
+        assert messages[1]["role"] == "assistant"
+        assert messages[1]["content"] == ""
+        assert len(messages[1]["tool_calls"]) == 1
+        assert messages[1]["tool_calls"][0]["function"]["name"] == "exec_command"
+        assert messages[2]["role"] == "tool"
+
+    def test_assistant_with_content_merged_with_function_call(self):
+        """Assistant message with non-empty content merges with tool_calls."""
+        items = [
+            InputItem(type="message", role="user", content="Check weather"),
+            InputItem(
+                type="message",
+                role="assistant",
+                content=[{"type": "output_text", "text": "Let me check."}],
+            ),
+            InputItem(
+                type="function_call",
+                call_id="call_1",
+                name="get_weather",
+                arguments='{"city": "Seoul"}',
+            ),
+            InputItem(
+                type="function_call_output",
+                call_id="call_1",
+                output='{"temp": 20}',
+            ),
+        ]
+        messages = convert_responses_input_to_messages(items)
+        assert len(messages) == 3
+        assert messages[1]["role"] == "assistant"
+        assert messages[1]["content"] == "Let me check."
+        assert len(messages[1]["tool_calls"]) == 1
+
+    def test_multi_round_tool_calls_no_duplicate_assistant(self):
+        """Multiple rounds of tool calls should not create duplicate assistant
+        messages (the pattern that causes model EOS after many rounds)."""
+        items = [
+            InputItem(type="message", role="user", content="Explore the code"),
+        ]
+        # Simulate 3 rounds of tool calls (Codex pattern)
+        for i in range(3):
+            items.extend([
+                InputItem(
+                    type="message",
+                    role="assistant",
+                    content=[{"type": "output_text", "text": ""}],
+                ),
+                InputItem(
+                    type="function_call",
+                    call_id=f"call_{i}",
+                    name="exec_command",
+                    arguments=f'{{"cmd": "cmd_{i}"}}',
+                ),
+                InputItem(
+                    type="function_call_output",
+                    call_id=f"call_{i}",
+                    output=f"result_{i}",
+                ),
+            ])
+        messages = convert_responses_input_to_messages(items)
+        # Count assistant messages — should be exactly 3 (one per round)
+        assistant_msgs = [m for m in messages if m["role"] == "assistant"]
+        assert len(assistant_msgs) == 3
+        # Each assistant message should have tool_calls
+        for msg in assistant_msgs:
+            assert "tool_calls" in msg
+            assert len(msg["tool_calls"]) == 1
+
+    def test_output_text_content_type(self):
+        """output_text content type should be parsed correctly."""
+        items = [
+            InputItem(
+                type="message",
+                role="assistant",
+                content=[{"type": "output_text", "text": "Hello world"}],
+            ),
+        ]
+        messages = convert_responses_input_to_messages(items)
+        assert messages[0]["content"] == "Hello world"
+
     def test_content_parts_array(self):
         items = [
             InputItem(
@@ -244,6 +352,33 @@ class TestConvertResponsesInput:
         assert messages[0]["role"] == "system"
         assert messages[1]["role"] == "assistant"
         assert messages[2]["role"] == "user"
+
+    def test_previous_system_messages_merge_with_current_instructions(self):
+        prev = [{"role": "system", "content": "Previous instruction"}]
+        messages = convert_responses_input_to_messages(
+            "New question",
+            instructions="Current instruction",
+            previous_messages=prev,
+        )
+        assert len(messages) == 2
+        assert messages[0]["role"] == "system"
+        assert "Previous instruction" in messages[0]["content"]
+        assert "Current instruction" in messages[0]["content"]
+
+    def test_current_function_call_does_not_merge_into_previous_assistant(self):
+        prev = [{"role": "assistant", "content": "Previous answer"}]
+        items = [
+            InputItem(
+                type="function_call",
+                call_id="call_next",
+                name="exec_command",
+                arguments='{"cmd":"pwd"}',
+            )
+        ]
+        messages = convert_responses_input_to_messages(items, previous_messages=prev)
+        assert len(messages) == 2
+        assert messages[0]["content"] == "Previous answer"
+        assert messages[1]["tool_calls"][0]["id"] == "call_next"
 
 
 # =============================================================================
@@ -445,6 +580,73 @@ class TestResponseStore:
         assert store.get("resp_1")["v"] == 2
         assert len(store) == 1
 
+    def test_disk_persistence_round_trip(self, tmp_path):
+        state_dir = tmp_path / "response-state"
+        store = ResponseStore(max_size=10, state_dir=state_dir)
+        public = {"id": "resp_1", "created_at": 1, "output": []}
+        record = build_response_store_record(public, [{"role": "user", "content": "Hi"}], [])
+        store.put("resp_1", record)
+
+        reloaded = ResponseStore(max_size=10, state_dir=state_dir)
+        assert reloaded.get("resp_1")["id"] == "resp_1"
+        assert reloaded.get_record("resp_1")["input_messages"][0]["content"] == "Hi"
+
+    def test_resolve_chain_messages(self, tmp_path):
+        state_dir = tmp_path / "response-state"
+        store = ResponseStore(max_size=10, state_dir=state_dir)
+        store.put(
+            "resp_1",
+            build_response_store_record(
+                {"id": "resp_1", "created_at": 1, "output": []},
+                [{"role": "user", "content": "First"}],
+                [{"role": "assistant", "content": "One"}],
+            ),
+        )
+        store.put(
+            "resp_2",
+            build_response_store_record(
+                {
+                    "id": "resp_2",
+                    "created_at": 2,
+                    "previous_response_id": "resp_1",
+                    "output": [],
+                },
+                [{"role": "tool", "tool_call_id": "call_1", "content": "result"}],
+                [{"role": "assistant", "content": "Two"}],
+            ),
+        )
+
+        messages = store.resolve_chain_messages("resp_2")
+        assert [m["content"] for m in messages if "content" in m] == [
+            "First",
+            "One",
+            "result",
+            "Two",
+        ]
+
+    def test_missing_response_chain_raises_not_found(self):
+        store = ResponseStore(max_size=10)
+        with pytest.raises(ResponseStateNotFoundError):
+            store.resolve_chain_messages("resp_missing")
+
+    def test_missing_ancestor_raises_corrupt(self):
+        store = ResponseStore(max_size=10)
+        store.put(
+            "resp_2",
+            build_response_store_record(
+                {
+                    "id": "resp_2",
+                    "created_at": 2,
+                    "previous_response_id": "resp_missing",
+                    "output": [],
+                },
+                [],
+                [],
+            ),
+        )
+        with pytest.raises(ResponseStateCorruptError):
+            store.resolve_chain_messages("resp_2")
+
 
 # =============================================================================
 # Previous Response Conversion Tests
@@ -486,17 +688,45 @@ class TestConvertStoredResponse:
             ]
         }
         messages = convert_stored_response_to_messages(stored)
-        assert len(messages) == 2
+        assert len(messages) == 1
         assert messages[0]["role"] == "assistant"
-        assert messages[1]["role"] == "assistant"
-        assert messages[1]["tool_calls"][0]["function"]["name"] == "get_weather"
+        assert messages[0]["content"] == "Let me check."
+        assert messages[0]["tool_calls"][0]["function"]["name"] == "get_weather"
         # arguments should be parsed as dict for Jinja2 chat templates
-        assert messages[1]["tool_calls"][0]["function"]["arguments"] == {"location": "Paris"}
+        assert messages[0]["tool_calls"][0]["function"]["arguments"] == {"location": "Paris"}
 
     def test_empty_output(self):
         stored = {"output": []}
         messages = convert_stored_response_to_messages(stored)
         assert messages == []
+
+    def test_state_record_prefers_output_messages(self):
+        stored = {
+            "output_messages": [
+                {"role": "assistant", "content": "Stored"},
+            ]
+        }
+        messages = convert_stored_response_to_messages(stored)
+        assert messages == [{"role": "assistant", "content": "Stored"}]
+
+    def test_normalize_response_output_merges_assistant_tool_call_turn(self):
+        output_items = [
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "Let me check."}],
+            },
+            {
+                "type": "function_call",
+                "call_id": "call_abc",
+                "name": "get_weather",
+                "arguments": '{"location":"Paris"}',
+            },
+        ]
+        messages = normalize_response_output_to_messages(output_items)
+        assert len(messages) == 1
+        assert messages[0]["content"] == "Let me check."
+        assert messages[0]["tool_calls"][0]["id"] == "call_abc"
 
 
 # =============================================================================

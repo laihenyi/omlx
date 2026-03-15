@@ -90,6 +90,7 @@ class EnginePool:
         self._current_model_memory = 0
         self._scheduler_config = scheduler_config or SchedulerConfig()
         self._process_memory_enforcer: object | None = None  # Set by server
+        self._settings_manager: object | None = None  # Set by server
 
     @property
     def max_model_memory(self) -> int | None:
@@ -235,16 +236,29 @@ class EnginePool:
         """Resolve a model alias to its actual model_id (directory name).
 
         Tries exact match in _entries first, then scans model settings
-        for alias match. Returns the original string if no match found.
+        for alias match. If those fail and input contains a provider prefix
+        (e.g. "omlx/my-model"), strips the prefix and retries.
+        Returns the original string if no match found.
         """
         if model_id_or_alias in self._entries:
             return model_id_or_alias
 
+        all_settings = None
         if settings_manager is not None:
             all_settings = settings_manager.get_all_settings()
             for mid, ms in all_settings.items():
                 if ms.model_alias and ms.model_alias == model_id_or_alias:
                     return mid
+
+        # Strip provider prefix (e.g. "omlx/qwen3.5-35b" -> "qwen3.5-35b")
+        if "/" in model_id_or_alias:
+            stripped = model_id_or_alias.split("/", 1)[1]
+            if stripped in self._entries:
+                return stripped
+            if all_settings is not None:
+                for mid, ms in all_settings.items():
+                    if ms.model_alias and ms.model_alias == stripped:
+                        return mid
 
         return model_id_or_alias
 
@@ -454,6 +468,11 @@ class EnginePool:
         try:
             logger.info(f"Loading model: {model_id}")
 
+            # Retrieve per-model settings for post-load transforms
+            model_settings = None
+            if self._settings_manager is not None:
+                model_settings = self._settings_manager.get_settings(model_id)
+
             # Create engine based on engine type
             if entry.engine_type == "embedding":
                 # EmbeddingEngine for embedding models
@@ -472,6 +491,7 @@ class EnginePool:
                 engine = BatchedEngine(
                     model_name=entry.model_path,
                     scheduler_config=self._scheduler_config,
+                    model_settings=model_settings,
                 )
 
             try:
@@ -494,6 +514,7 @@ class EnginePool:
                     engine = BatchedEngine(
                         model_name=entry.model_path,
                         scheduler_config=self._scheduler_config,
+                        model_settings=model_settings,
                     )
                     await engine.start()
 

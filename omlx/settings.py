@@ -72,6 +72,14 @@ def get_system_memory() -> int:
     return 16 * 1024**3
 
 
+def _adaptive_system_reserve(total: int) -> int:
+    """Adaptive system reservation: 20% of total, clamped to [2GB, 8GB]."""
+    reserve = int(total * 0.20)
+    min_reserve = 2 * 1024**3
+    max_reserve = 8 * 1024**3
+    return max(min_reserve, min(reserve, max_reserve))
+
+
 def get_ssd_capacity(path: str | Path) -> int:
     """
     Return disk capacity in bytes for the given path.
@@ -129,6 +137,7 @@ class ModelSettings:
     model_dirs: list[str] = field(default_factory=list)  # [] means ~/.omlx/models
     model_dir: str | None = None  # Deprecated: kept for backward compatibility
     max_model_memory: str = "auto"  # "auto" means 80% of RAM
+    model_fallback: bool = False  # Use default model when requested model not found
 
     def get_model_dirs(self, base_path: Path) -> list[Path]:
         """
@@ -171,8 +180,8 @@ class ModelSettings:
             return None
         if value == "auto":
             total = get_system_memory()
-            usable = max(0, total - 8 * 1024**3)
-            return int(usable * 0.9)
+            reserve = _adaptive_system_reserve(total)
+            return max(1 * 1024**3, int((total - reserve) * 0.9))
         return parse_size(self.max_model_memory)
 
     def to_dict(self) -> dict[str, Any]:
@@ -181,6 +190,7 @@ class ModelSettings:
             "model_dirs": self.model_dirs,
             "model_dir": self.model_dirs[0] if self.model_dirs else self.model_dir,
             "max_model_memory": self.max_model_memory,
+            "model_fallback": self.model_fallback,
         }
 
     @classmethod
@@ -194,6 +204,7 @@ class ModelSettings:
             model_dirs=model_dirs,
             model_dir=data.get("model_dir"),
             max_model_memory=data.get("max_model_memory", "auto"),
+            model_fallback=data.get("model_fallback", False),
         )
 
 
@@ -303,9 +314,9 @@ class MemorySettings:
         if value == "disabled":
             return None
         if value == "auto":
-            reserved = 8 * 1024**3  # 8GB reserved for system
             total = get_system_memory()
-            return max(total - reserved, int(total * 0.1))
+            reserve = _adaptive_system_reserve(total)
+            return total - reserve
         # Parse percentage like "80%"
         percent_str = value.rstrip("%")
         try:
@@ -416,6 +427,22 @@ class HuggingFaceSettings:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "HuggingFaceSettings":
+        """Create from dictionary."""
+        return cls(endpoint=data.get("endpoint", ""))
+
+
+@dataclass
+class ModelScopeSettings:
+    """ModelScope Hub configuration settings."""
+
+    endpoint: str = ""  # Empty string = use default (https://modelscope.cn)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dictionary."""
+        return {"endpoint": self.endpoint}
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "ModelScopeSettings":
         """Create from dictionary."""
         return cls(endpoint=data.get("endpoint", ""))
 
@@ -595,6 +622,7 @@ class GlobalSettings:
     auth: AuthSettings = field(default_factory=AuthSettings)
     mcp: MCPSettings = field(default_factory=MCPSettings)
     huggingface: HuggingFaceSettings = field(default_factory=HuggingFaceSettings)
+    modelscope: ModelScopeSettings = field(default_factory=ModelScopeSettings)
     sampling: SamplingSettings = field(default_factory=SamplingSettings)
     logging: LoggingSettings = field(default_factory=LoggingSettings)
     claude_code: ClaudeCodeSettings = field(default_factory=ClaudeCodeSettings)
@@ -677,6 +705,8 @@ class GlobalSettings:
                 self.mcp = MCPSettings.from_dict(data["mcp"])
             if "huggingface" in data:
                 self.huggingface = HuggingFaceSettings.from_dict(data["huggingface"])
+            if "modelscope" in data:
+                self.modelscope = ModelScopeSettings.from_dict(data["modelscope"])
             if "sampling" in data:
                 self.sampling = SamplingSettings.from_dict(data["sampling"])
             if "logging" in data:
@@ -761,6 +791,10 @@ class GlobalSettings:
         if hf_endpoint := os.getenv("OMLX_HF_ENDPOINT"):
             self.huggingface.endpoint = hf_endpoint
 
+        # ModelScope settings
+        if ms_endpoint := os.getenv("OMLX_MS_ENDPOINT"):
+            self.modelscope.endpoint = ms_endpoint
+
         # Logging settings
         if log_dir := os.getenv("OMLX_LOG_DIR"):
             self.logging.log_dir = log_dir
@@ -834,6 +868,10 @@ class GlobalSettings:
         if hasattr(args, "hf_endpoint") and args.hf_endpoint is not None:
             self.huggingface.endpoint = args.hf_endpoint
 
+        # ModelScope settings
+        if hasattr(args, "ms_endpoint") and args.ms_endpoint is not None:
+            self.modelscope.endpoint = args.ms_endpoint
+
     def save(self) -> None:
         """Save current settings to the settings file."""
         self.ensure_directories()
@@ -849,6 +887,7 @@ class GlobalSettings:
             "auth": self.auth.to_dict(),
             "mcp": self.mcp.to_dict(),
             "huggingface": self.huggingface.to_dict(),
+            "modelscope": self.modelscope.to_dict(),
             "sampling": self.sampling.to_dict(),
             "logging": self.logging.to_dict(),
             "claude_code": self.claude_code.to_dict(),
@@ -999,6 +1038,15 @@ class GlobalSettings:
                     "(must start with http:// or https://)"
                 )
 
+        # ModelScope validation
+        if self.modelscope.endpoint:
+            endpoint = self.modelscope.endpoint.strip()
+            if endpoint and not endpoint.startswith(("http://", "https://")):
+                errors.append(
+                    f"Invalid modelscope endpoint: '{endpoint}' "
+                    "(must start with http:// or https://)"
+                )
+
         return errors
 
     def to_scheduler_config(self) -> SchedulerConfig:
@@ -1029,6 +1077,7 @@ class GlobalSettings:
             "auth": self.auth.to_dict(),
             "mcp": self.mcp.to_dict(),
             "huggingface": self.huggingface.to_dict(),
+            "modelscope": self.modelscope.to_dict(),
             "sampling": self.sampling.to_dict(),
             "logging": self.logging.to_dict(),
             "claude_code": self.claude_code.to_dict(),

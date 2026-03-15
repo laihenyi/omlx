@@ -52,6 +52,7 @@
                                             class="px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
                                         <option value="en">{{ t('settings.language.en') }}</option>
                                         <option value="zh">{{ t('settings.language.zh') }}</option>
+                                        <option value="zh-TW">{{ t('settings.language.zh-TW') }}</option>
                                         <option value="ko">{{ t('settings.language.ko') }}</option>
                                         <option value="ja">{{ t('settings.language.ja') }}</option>
                                     </select>
@@ -264,6 +265,19 @@
                                 </div>
                             </div>
                             <div class="divide-y divide-neutral-100">
+                                <div class="flex items-center justify-between px-6 py-4">
+                                    <div>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.model.model_fallback') }}</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.model.model_fallback_desc') }}</p>
+                                    </div>
+                                    <button type="button"
+                                            @click="globalSettings.model.model_fallback = !globalSettings.model.model_fallback"
+                                            :class="globalSettings.model.model_fallback ? 'bg-black' : 'bg-neutral-200'"
+                                            class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
+                                        <span :class="globalSettings.model.model_fallback ? 'translate-x-5' : 'translate-x-0'"
+                                              class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                    </button>
+                                </div>
                                 <div class="px-6 py-4">
                                     <div class="flex items-center justify-between mb-3">
                                         <div class="flex items-center gap-2">
@@ -694,7 +708,17 @@
                     <!-- Header -->
                     <div class="mb-8">
                         <h2 class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-2">{{ t('settings.models.section_label') }}</h2>
-                        <h3 class="text-2xl font-bold tracking-tight text-neutral-900">{{ t('settings.models.heading') }}</h3>
+                        <div class="flex items-center gap-3">
+                            <h3 class="text-2xl font-bold tracking-tight text-neutral-900">{{ t('settings.models.heading') }}</h3>
+                            <button @click="reloadModels()"
+                                    :disabled="reloading"
+                                    class="px-3 py-1.5 text-xs font-medium text-neutral-500 hover:text-neutral-700
+                                           hover:bg-neutral-100 rounded-lg transition-all flex items-center gap-1.5
+                                           disabled:opacity-50 disabled:cursor-not-allowed">
+                                <span class="inline-flex" :class="reloading && 'animate-spin'"><i data-lucide="rotate-cw" class="w-3.5 h-3.5"></i></span>
+                                <span x-text="reloading ? window.t('models.manager.reloading') : window.t('models.manager.reload')"></span>
+                            </button>
+                        </div>
                         <p class="text-sm text-neutral-500 mt-2">{{ t('settings.models.description') }}</p>
                     </div>
 

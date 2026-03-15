@@ -52,6 +52,7 @@ class ModelSettings:
     ttl_seconds: Optional[int] = None  # Auto-unload after idle seconds (None = no TTL)
     model_type_override: Optional[str] = None  # "llm", "vlm", "embedding", "reranker", or None (auto-detect)
     model_alias: Optional[str] = None  # API-visible name (alternative to directory name)
+    index_cache_freq: Optional[int] = None  # IndexCache: every Nth layer keeps indexer (DSA models only)
 
     # Model management flags
     is_pinned: bool = False
@@ -204,7 +205,6 @@ class ModelSettingsManager:
                 settings = self._settings[model_id]
                 return ModelSettings.from_dict(settings.to_dict())
 
-            logger.log(5, "No settings found for model '%s', using defaults", model_id)
             return ModelSettings()
 
     def set_settings(self, model_id: str, settings: ModelSettings) -> None:

@@ -1,8 +1,8 @@
 class Omlx < Formula
   desc "LLM inference server optimized for Apple Silicon"
   homepage "https://github.com/jundot/omlx"
-  url "https://github.com/jundot/omlx/archive/refs/tags/v0.2.8.tar.gz"
-  sha256 "dc0be4a297822b5d934605bff3b384dc2ff0c8f13c3e5eecb36e05c12922687e"
+  url "https://github.com/jundot/omlx/archive/refs/tags/v0.2.12.tar.gz"
+  sha256 "5744ad29522992dc4ee7297f26b9ee23ef7fcbbd68bf368d52b3f5c3312e846a"
   license "Apache-2.0"
 
   depends_on "rust" => :build
@@ -26,10 +26,10 @@ class Omlx < Formula
     # Upgrade pip to ensure modern resolver (handles git deps, etc.)
     system libexec/"bin/pip", "install", "--upgrade", "pip"
 
-    # Build pydantic-core from source with headerpad to prevent
+    # Build Rust-based packages from source with headerpad to prevent
     # Homebrew dylib ID fixup failure (Mach-O header too small for absolute paths)
     ENV.append "LDFLAGS", "-Wl,-headerpad_max_install_names"
-    system libexec/"bin/pip", "install", "--no-binary", "pydantic-core", buildpath
+    system libexec/"bin/pip", "install", "--no-binary", "pydantic-core,rpds-py,tiktoken,tokenizers", buildpath
 
     bin.install_symlink Dir[libexec/"bin/omlx"]
   end
