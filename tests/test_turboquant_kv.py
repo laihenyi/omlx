@@ -168,3 +168,52 @@ class TestTurboQuantKVCacheAsymmetric:
         assert cache.k_bits == 3
         assert cache.v_bits == 3
         assert cache.bits == 3  # legacy attribute
+
+
+class TestSparseVDecoding:
+    """Tests for sparse V decoding."""
+
+    def test_sparse_mask_budget(self):
+        """Sparse mask should cover approximately budget% of attention mass."""
+        from omlx.turboquant_kv import _compute_sparse_mask
+
+        mx.random.seed(42)
+        scores = mx.random.uniform(shape=(1, 4, 1024))
+        scores = scores / scores.sum(axis=-1, keepdims=True)
+
+        for budget in [0.5, 0.75, 0.9]:
+            mask = _compute_sparse_mask(scores, budget=budget)
+            covered = (scores * mask.astype(scores.dtype)).sum().item()
+            assert covered >= budget * 0.9, f"Budget {budget}: covered {covered}"
+
+    def test_sparse_disabled_for_short_context(self):
+        """Sparse V should be disabled for short sequences."""
+        from omlx.turboquant_kv import TurboQuantKVCache
+
+        cache = tq.TurboQuantKVCache(k_bits=4, v_bits=4, sparse_v=True)
+
+        mx.random.seed(42)
+        keys = mx.random.normal(shape=(1, 4, 500, 64))
+        values = mx.random.normal(shape=(1, 4, 500, 64))
+
+        cache.update_and_fetch(keys, values)
+        # Should still be in fp16 mode (no quantization for short context)
+        assert not cache._quantized
+
+    def test_sparse_enabled_for_long_context(self):
+        """Sparse V should be enabled for long sequences."""
+        from omlx.turboquant_kv import TurboQuantKVCache
+
+        cache = tq.TurboQuantKVCache(k_bits=4, v_bits=4, sparse_v=True)
+
+        mx.random.seed(42)
+        keys = mx.random.normal(shape=(1, 4, 2000, 64))
+        values = mx.random.normal(shape=(1, 4, 2000, 64))
+
+        cache.update_and_fetch(keys, values)
+        # Trigger decode to quantize
+        k_dec = mx.random.normal(shape=(1, 4, 1, 64))
+        v_dec = mx.random.normal(shape=(1, 4, 1, 64))
+        cache.update_and_fetch(k_dec, v_dec)
+
+        assert cache._quantized

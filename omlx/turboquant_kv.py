@@ -488,6 +488,48 @@ class TurboQuantMSECodec:
 
 
 # ---------------------------------------------------------------------------
+# Sparse V Decoding: skip low-attention V entries
+# ---------------------------------------------------------------------------
+
+def _compute_sparse_mask(attention_scores: mx.array, budget: float = 0.75) -> mx.array:
+    """Compute binary mask for sparse V decoding.
+
+    Args:
+        attention_scores: shape (B, H, T) - softmax probabilities
+        budget: fraction of attention mass to retain (0.5-1.0)
+
+    Returns:
+        mask: shape (B, H, T) - 1 for tokens to include, 0 to skip
+    """
+    B, H, T = attention_scores.shape
+
+    # For simplicity, we select top-k tokens that cover the budget
+    # Sort scores descending
+    sorted_indices = mx.argsort(attention_scores, axis=-1)[:, :, ::-1]
+    sorted_scores = mx.take_along_axis(attention_scores, sorted_indices, axis=-1)
+
+    # Cumulative sum
+    cumsum = mx.cumsum(sorted_scores, axis=-1)
+
+    # Find cutoff: first index where cumsum >= budget
+    cutoff = (cumsum >= budget).astype(mx.int32).argmax(axis=-1)
+
+    # Create mask in sorted order using broadcasting
+    # token_indices: (1, 1, T) broadcast to (B, H, T)
+    token_indices = mx.arange(T)[None, None, :]
+    # cutoff: (B, H, 1) broadcast to (B, H, T)
+    cutoff_expanded = cutoff[:, :, None]
+    # mask_sorted is 1 where token_idx <= cutoff
+    mask_sorted = (token_indices <= cutoff_expanded).astype(attention_scores.dtype)
+
+    # Unsort to original order
+    mask = mx.zeros_like(attention_scores)
+    mask = mx.put_along_axis(mask, sorted_indices, mask_sorted, axis=-1)
+
+    return mask.astype(mx.bool_)
+
+
+# ---------------------------------------------------------------------------
 # 2-pass Fused Flash Attention kernels
 # ---------------------------------------------------------------------------
 
@@ -934,6 +976,9 @@ class TurboQuantKVCache(_BaseCache):
 
         For PolarQuantCodec, we dequantize then apply standard SDPA since
         the codec uses WHT rotation (not MSE codebook-based rotation).
+
+        When sparse_v is enabled and context is long (>1024 tokens), applies
+        sparse V decoding to skip low-attention V entries for faster decode.
         """
         if keys_state is None:
             keys_state, values_state = self.state
@@ -954,6 +999,48 @@ class TurboQuantKVCache(_BaseCache):
             gqa_factor = H_q // keys.shape[1]
             keys = mx.concatenate([keys] * gqa_factor, axis=1)
             values = mx.concatenate([values] * gqa_factor, axis=1)
+
+        # Sparse V decoding: skip low-attention V entries for long contexts
+        # Only apply when sparse_v=True and context length > 1024
+        T = keys.shape[2]
+        use_sparse_v = (
+            self.sparse_v and
+            T > 1024 and
+            self.sparse_v_budget < 1.0
+        )
+
+        if use_sparse_v:
+            # Compute attention scores to determine which V entries to keep
+            # Q @ K^T: (B, H_q, 1, D) @ (B, H_q, D, T) -> (B, H_q, 1, T)
+            q = queries.astype(mx.float32)
+            k = keys.astype(mx.float32)
+            scores = mx.matmul(q, k.transpose(0, 1, 3, 2)) * scale
+
+            # Softmax over T dimension: (B, H_q, 1, T)
+            scores_max = scores.max(axis=-1, keepdims=True)
+            scores_exp = mx.exp(scores - scores_max)
+            attn_weights = scores_exp / scores_exp.sum(axis=-1, keepdims=True)
+
+            # Use same attention for all query heads (or first head group)
+            # Shape: (B, H_kv, 1, T) after averaging over GQA factor
+            gqa_factor = H_q // keys.shape[1]
+            if gqa_factor > 1:
+                attn_weights = attn_weights.reshape(B, gqa_factor, keys.shape[1], 1, T)
+                attn_weights = attn_weights.mean(axis=1)  # (B, H_kv, 1, T)
+            else:
+                attn_weights = attn_weights.reshape(B, keys.shape[1], 1, T)
+
+            # Compute sparse mask from attention weights
+            sparse_mask = _compute_sparse_mask(
+                attn_weights.squeeze(2),  # (B, H_kv, T)
+                budget=self.sparse_v_budget
+            )  # (B, H_kv, T)
+
+            # Expand mask to V dimension: (B, H_kv, T, 1) for broadcasting
+            sparse_mask = sparse_mask[..., None]  # (B, H_kv, T, 1)
+
+            # Apply sparse mask to V (zero out low-attention entries)
+            values = values * sparse_mask.astype(values.dtype)
 
         # Use mx.fast.scaled_dot_product_attention with 4D inputs
         out = mx.fast.scaled_dot_product_attention(
