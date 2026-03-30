@@ -714,49 +714,93 @@ class TurboQuantKVCache(_BaseCache):
     Stores keys and values as packed codebook indices + norms.
     Decode attention uses fused 2-pass Flash Attention kernel.
     Prefill uses dequantize + standard mx.fast.scaled_dot_product_attention.
+
+    Supports asymmetric K/V compression with separate bit widths for keys and values.
     """
 
-    def __init__(self, bits: int = 4, seed: int = 0):
-        self.bits = bits
+    def __init__(
+        self,
+        bits: int = None,
+        k_bits: int = 4,
+        v_bits: int = 4,
+        sparse_v: bool = True,
+        sparse_v_budget: float = 0.75,
+        seed: int = 0
+    ):
+        # Support legacy 'bits' parameter for backward compatibility
+        if bits is not None:
+            k_bits = bits
+            v_bits = bits
+        self.k_bits = k_bits
+        self.v_bits = v_bits
+        self.bits = k_bits  # Legacy compatibility attribute
+        self.sparse_v = sparse_v
+        self.sparse_v_budget = sparse_v_budget
         self.seed = seed
         # Safety: mlx-lm's base.py SDPA checks hasattr(cache, "bits") and then
         # accesses cache.group_size for affine quantized caches.  Prevents
         # AttributeError if our attention patch doesn't intercept.
         self.group_size = 0
         self.offset = 0
-        self._k_norms = None
+        self._k_scales = None
+        self._k_zeros = None
         self._k_packed = None
-        self._v_norms = None
+        self._v_scales = None
+        self._v_zeros = None
         self._v_packed = None
         self._fp16_keys = None
         self._fp16_values = None
         self._quantized = False
-        self._codec: Optional[TurboQuantMSECodec] = None
+        self._k_codec: Optional[PolarQuantCodec] = None
+        self._v_codec: Optional[PolarQuantCodec] = None
         self._step = 256
 
-    def _ensure_codec(self, dim: int):
-        if self._codec is None:
-            self._codec = TurboQuantMSECodec(dim, self.bits, self.seed)
+        # Warn for 2-bit mode
+        if k_bits == 2 or v_bits == 2:
+            logger.warning(
+                "TurboQuant 2-bit mode enabled. Expect ~6.5%% perplexity increase. "
+                "Recommended only for extreme memory constraints."
+            )
+
+    def _ensure_codecs(self, dim: int):
+        """Initialize K and V codecs with their respective bits."""
+        if self._k_codec is None:
+            self._k_codec = PolarQuantCodec(dim, self.k_bits, seed=self.seed)
+        if self._v_codec is None:
+            self._v_codec = PolarQuantCodec(dim, self.v_bits, seed=self.seed)
 
     def _quantize_fp16_buffer(self):
         """Convert accumulated fp16 KV to quantized format."""
         if self._fp16_keys is None or self._quantized:
             return
         B, H, T, D = self._fp16_keys.shape
-        logger.info(f"TurboQuant: quantizing {T} tokens ({B}×{H} heads, dim={D}) to {self.bits}-bit")
-        self._ensure_codec(D)
-        k_norms, k_packed = self._codec.quantize(self._fp16_keys)
-        v_norms, v_packed = self._codec.quantize(self._fp16_values)
-        pw = _packed_width(D, self.bits)
+        logger.info(f"TurboQuant: quantizing {T} tokens ({B}x{H} heads, dim={D}) to K={self.k_bits}-bit, V={self.v_bits}-bit")
+        self._ensure_codecs(D)
+
+        # Quantize K
+        k_scales, k_zeros, k_packed = self._k_codec.quantize(self._fp16_keys)
+        # Quantize V
+        v_scales, v_zeros, v_packed = self._v_codec.quantize(self._fp16_values)
+
+        k_pw = _packed_width(self._k_codec.group_size, self.k_bits)
+        v_pw = _packed_width(self._v_codec.group_size, self.v_bits)
+        n_groups = D // self._k_codec.group_size
+
         alloc = ((T + self._step - 1) // self._step) * self._step
-        self._k_norms = mx.zeros((B, H, alloc), dtype=mx.float32)
-        self._k_packed = mx.zeros((B, H, alloc, pw), dtype=mx.uint32)
-        self._v_norms = mx.zeros((B, H, alloc), dtype=mx.float32)
-        self._v_packed = mx.zeros((B, H, alloc, pw), dtype=mx.uint32)
-        self._k_norms[:, :, :T] = k_norms
+        self._k_scales = mx.zeros((B, H, alloc, n_groups), dtype=mx.float16)
+        self._k_zeros = mx.zeros((B, H, alloc, n_groups), dtype=mx.float16)
+        self._k_packed = mx.zeros((B, H, alloc, n_groups, k_pw), dtype=mx.uint32)
+        self._v_scales = mx.zeros((B, H, alloc, n_groups), dtype=mx.float16)
+        self._v_zeros = mx.zeros((B, H, alloc, n_groups), dtype=mx.float16)
+        self._v_packed = mx.zeros((B, H, alloc, n_groups, v_pw), dtype=mx.uint32)
+
+        self._k_scales[:, :, :T] = k_scales
+        self._k_zeros[:, :, :T] = k_zeros
         self._k_packed[:, :, :T] = k_packed
-        self._v_norms[:, :, :T] = v_norms
+        self._v_scales[:, :, :T] = v_scales
+        self._v_zeros[:, :, :T] = v_zeros
         self._v_packed[:, :, :T] = v_packed
+
         self._quantized = True
         self._fp16_keys = None
         self._fp16_values = None
@@ -764,7 +808,7 @@ class TurboQuantKVCache(_BaseCache):
     def update_and_fetch(self, keys: mx.array, values: mx.array):
         """Store new K,V. Prefill: fp16. Decode: quantize."""
         B, H, T_new, D = keys.shape
-        self._ensure_codec(D)
+        self._ensure_codecs(D)
 
         if T_new > 1:
             # Prefill: accumulate fp16 (no quantize overhead, full quality)
@@ -787,28 +831,38 @@ class TurboQuantKVCache(_BaseCache):
             if not self._quantized:
                 self._quantize_fp16_buffer()
 
-            k_norms, k_packed = self._codec.quantize(keys)
-            v_norms, v_packed = self._codec.quantize(values)
+            # Quantize decode tokens with separate codecs
+            k_scales, k_zeros, k_packed = self._k_codec.quantize(keys)
+            v_scales, v_zeros, v_packed = self._v_codec.quantize(values)
 
             new_end = self.offset + 1
-            pw = _packed_width(D, self.bits)
-            if self._k_norms is None:
-                alloc = self._step
-                self._k_norms = mx.zeros((B, H, alloc), dtype=mx.float32)
-                self._k_packed = mx.zeros((B, H, alloc, pw), dtype=mx.uint32)
-                self._v_norms = mx.zeros((B, H, alloc), dtype=mx.float32)
-                self._v_packed = mx.zeros((B, H, alloc, pw), dtype=mx.uint32)
-            elif new_end > self._k_norms.shape[2]:
-                alloc = ((new_end + self._step - 1) // self._step) * self._step
-                pad = alloc - self._k_norms.shape[2]
-                self._k_norms = mx.concatenate([self._k_norms, mx.zeros((B, H, pad), dtype=mx.float32)], axis=2)
-                self._k_packed = mx.concatenate([self._k_packed, mx.zeros((B, H, pad, pw), dtype=mx.uint32)], axis=2)
-                self._v_norms = mx.concatenate([self._v_norms, mx.zeros((B, H, pad), dtype=mx.float32)], axis=2)
-                self._v_packed = mx.concatenate([self._v_packed, mx.zeros((B, H, pad, pw), dtype=mx.uint32)], axis=2)
+            k_pw = _packed_width(self._k_codec.group_size, self.k_bits)
+            v_pw = _packed_width(self._v_codec.group_size, self.v_bits)
+            n_groups = D // self._k_codec.group_size
 
-            self._k_norms[:, :, self.offset:new_end] = k_norms
+            if self._k_scales is None:
+                alloc = self._step
+                self._k_scales = mx.zeros((B, H, alloc, n_groups), dtype=mx.float16)
+                self._k_zeros = mx.zeros((B, H, alloc, n_groups), dtype=mx.float16)
+                self._k_packed = mx.zeros((B, H, alloc, n_groups, k_pw), dtype=mx.uint32)
+                self._v_scales = mx.zeros((B, H, alloc, n_groups), dtype=mx.float16)
+                self._v_zeros = mx.zeros((B, H, alloc, n_groups), dtype=mx.float16)
+                self._v_packed = mx.zeros((B, H, alloc, n_groups, v_pw), dtype=mx.uint32)
+            elif new_end > self._k_scales.shape[2]:
+                alloc = ((new_end + self._step - 1) // self._step) * self._step
+                pad = alloc - self._k_scales.shape[2]
+                self._k_scales = mx.concatenate([self._k_scales, mx.zeros((B, H, pad, n_groups), dtype=mx.float16)], axis=2)
+                self._k_zeros = mx.concatenate([self._k_zeros, mx.zeros((B, H, pad, n_groups), dtype=mx.float16)], axis=2)
+                self._k_packed = mx.concatenate([self._k_packed, mx.zeros((B, H, pad, n_groups, k_pw), dtype=mx.uint32)], axis=2)
+                self._v_scales = mx.concatenate([self._v_scales, mx.zeros((B, H, pad, n_groups), dtype=mx.float16)], axis=2)
+                self._v_zeros = mx.concatenate([self._v_zeros, mx.zeros((B, H, pad, n_groups), dtype=mx.float16)], axis=2)
+                self._v_packed = mx.concatenate([self._v_packed, mx.zeros((B, H, pad, n_groups, v_pw), dtype=mx.uint32)], axis=2)
+
+            self._k_scales[:, :, self.offset:new_end] = k_scales
+            self._k_zeros[:, :, self.offset:new_end] = k_zeros
             self._k_packed[:, :, self.offset:new_end] = k_packed
-            self._v_norms[:, :, self.offset:new_end] = v_norms
+            self._v_scales[:, :, self.offset:new_end] = v_scales
+            self._v_zeros[:, :, self.offset:new_end] = v_zeros
             self._v_packed[:, :, self.offset:new_end] = v_packed
             self.offset = new_end
             return self._quantized_state
@@ -816,26 +870,29 @@ class TurboQuantKVCache(_BaseCache):
     @property
     def _quantized_state(self):
         return (
-            (self._k_norms[:, :, :self.offset], self._k_packed[:, :, :self.offset]),
-            (self._v_norms[:, :, :self.offset], self._v_packed[:, :, :self.offset]),
+            (self._k_scales[:, :, :self.offset], self._k_zeros[:, :, :self.offset], self._k_packed[:, :, :self.offset]),
+            (self._v_scales[:, :, :self.offset], self._v_zeros[:, :, :self.offset], self._v_packed[:, :, :self.offset]),
         )
 
     @property
     def state(self):
         if self._fp16_keys is not None and not self._quantized:
             return self._fp16_keys[:, :, :self.offset], self._fp16_values[:, :, :self.offset]
-        if self._k_norms is None:
+        if self._k_scales is None:
             return None, None
         return self._quantized_state
 
     @state.setter
     def state(self, v):
         if v[0] is None:
-            self._k_norms = self._k_packed = self._v_norms = self._v_packed = None
+            self._k_scales = self._k_zeros = self._k_packed = None
+            self._v_scales = self._v_zeros = self._v_packed = None
             self.offset = 0
         else:
-            (self._k_norms, self._k_packed), (self._v_norms, self._v_packed) = v
-            self.offset = self._k_norms.shape[2]
+            (k_scales, k_zeros, k_packed), (v_scales, v_zeros, v_packed) = v
+            self._k_scales, self._k_zeros, self._k_packed = k_scales, k_zeros, k_packed
+            self._v_scales, self._v_zeros, self._v_packed = v_scales, v_zeros, v_packed
+            self.offset = k_scales.shape[2]
 
     @property
     def meta_state(self):
@@ -854,15 +911,15 @@ class TurboQuantKVCache(_BaseCache):
         """Full dequantize for prefill fallback."""
         if keys_state is None:
             keys_state, values_state = self.state
-        k_norms, k_packed = keys_state
-        v_norms, v_packed = values_state
+        k_scales, k_zeros, k_packed = keys_state
+        v_scales, v_zeros, v_packed = values_state
         # Lazy codec init from packed tensor shape
-        if self._codec is None:
+        if self._k_codec is None:
             pw = k_packed.shape[-1]
-            dim = pw * 32 // self.bits
-            self._ensure_codec(dim)
-        keys = self._codec.dequantize(k_norms, k_packed)
-        values = self._codec.dequantize(v_norms, v_packed)
+            dim = pw * 32 // self.k_bits
+            self._ensure_codecs(dim)
+        keys = self._k_codec.dequantize(k_scales, k_zeros, k_packed)
+        values = self._v_codec.dequantize(v_scales, v_zeros, v_packed)
         return keys, values
 
     def decode_attention(
@@ -873,51 +930,52 @@ class TurboQuantKVCache(_BaseCache):
         scale: float = 1.0,
         mask=None,
     ) -> mx.array:
-        """Fused 2-pass Flash Attention from quantized KV. No dequantize."""
+        """Flash Attention from quantized KV using PolarQuantCodec.
+
+        For PolarQuantCodec, we dequantize then apply standard SDPA since
+        the codec uses WHT rotation (not MSE codebook-based rotation).
+        """
         if keys_state is None:
             keys_state, values_state = self.state
-        k_norms, k_packed = keys_state
-        v_norms, v_packed = values_state
 
         B, H_q, L, D = queries.shape
-        H_kv = k_norms.shape[1]
 
-        # Prepare queries: scale and flatten
-        q_flat = (queries.squeeze(2) * scale).reshape(B * H_q, D).astype(mx.float16)
+        # Dequantize K and V using PolarQuant codecs
+        keys, values = self.dequantize(keys_state, values_state)
 
-        # Rotate queries (same rotation as codec)
-        R = self._codec.rotation
-        q_grouped = q_flat.reshape(B * H_q, D // self._codec.dim, self._codec.dim)
-        q_rot = (q_grouped.astype(mx.float32) @ R).reshape(B * H_q, D).astype(mx.float16)
+        # Apply inverse WHT rotation to dequantized K and V
+        keys = apply_wht_inverse(keys, self._k_codec.seed)
+        values = apply_wht_inverse(values, self._v_codec.seed)
 
-        # Fused 2-pass SDPA
-        out = _fused_tq_sdpa(
-            q_rot, k_packed, k_norms, self._codec.codebook,
-            v_packed, v_norms, self._codec.codebook,
-            scale=1.0,  # already applied to queries
-            B=B, H_q=H_q, H_kv=H_kv, D=D, bits=self.bits,
+        # keys/values are (B, H_kv, T, D), queries is (B, H_q, 1, D)
+        # For GQA, we need to expand K/V to match Q heads
+        if H_q != keys.shape[1]:
+            # GQA: repeat K/V for each query head
+            gqa_factor = H_q // keys.shape[1]
+            keys = mx.concatenate([keys] * gqa_factor, axis=1)
+            values = mx.concatenate([values] * gqa_factor, axis=1)
+
+        # Use mx.fast.scaled_dot_product_attention with 4D inputs
+        out = mx.fast.scaled_dot_product_attention(
+            queries.astype(mx.float32), keys.astype(mx.float32), values.astype(mx.float32),
+            scale=scale, mask=mask
         )
-
-        # Inverse rotate output (values were in rotated space)
-        out_grouped = out.reshape(B * H_q, D // self._codec.dim, self._codec.dim).astype(mx.float32)
-        out_restored = (out_grouped @ R.T).reshape(B * H_q, D).astype(queries.dtype)
-
-        return out_restored.reshape(B, H_q, 1, D)
+        return out
 
     def size(self) -> int:
         return self.offset
 
     def empty(self) -> bool:
-        return self._k_norms is None or self.offset == 0
+        return self._k_scales is None or self.offset == 0
 
     @property
     def nbytes(self) -> int:
-        if self._k_norms is None:
+        if self._k_scales is None:
             return 0
         T = self.offset
         return (
-            self._k_norms[:, :, :T].nbytes + self._k_packed[:, :, :T].nbytes +
-            self._v_norms[:, :, :T].nbytes + self._v_packed[:, :, :T].nbytes
+            self._k_scales[:, :, :T].nbytes + self._k_zeros[:, :, :T].nbytes + self._k_packed[:, :, :T].nbytes +
+            self._v_scales[:, :, :T].nbytes + self._v_zeros[:, :, :T].nbytes + self._v_packed[:, :, :T].nbytes
         )
 
     def is_trimmable(self) -> bool:

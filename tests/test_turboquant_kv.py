@@ -122,3 +122,49 @@ class TestPolarQuantCodec:
                 # pw = ceil(group_size * bits / 32)
                 expected = (group_size * bits + 31) // 32
                 assert pw == expected, f"bits={bits}, group={group_size}"
+
+
+class TestTurboQuantKVCacheAsymmetric:
+    """Tests for asymmetric K/V bit support."""
+
+    def test_asymmetric_initialization(self):
+        """Cache accepts different bits for K and V."""
+        cache = tq.TurboQuantKVCache(k_bits=4, v_bits=2)
+        assert cache.k_bits == 4
+        assert cache.v_bits == 2
+
+    def test_asymmetric_update_and_fetch(self):
+        """Update and fetch with asymmetric bits."""
+        cache = tq.TurboQuantKVCache(k_bits=4, v_bits=3, sparse_v=False)
+
+        mx.random.seed(42)
+        keys = mx.random.normal(shape=(1, 4, 100, 128))
+        values = mx.random.normal(shape=(1, 4, 100, 128))
+
+        # Prefill
+        k_out, v_out = cache.update_and_fetch(keys, values)
+        assert k_out.shape == keys.shape
+        assert v_out.shape == values.shape
+
+        # Decode
+        k_dec = mx.random.normal(shape=(1, 4, 1, 128))
+        v_dec = mx.random.normal(shape=(1, 4, 1, 128))
+        cache.update_and_fetch(k_dec, v_dec)
+        assert cache.offset == 101
+
+    def test_turbo2_warning(self, caplog):
+        """Using 2-bit should log a warning."""
+        import logging
+
+        with caplog.at_level(logging.WARNING):
+            tq.TurboQuantKVCache(k_bits=2, v_bits=2)
+
+        assert any("2-bit" in record.message for record in caplog.records)
+
+    def test_legacy_bits_compatibility(self):
+        """Legacy 'bits' parameter should work for backward compatibility."""
+        # Single bits parameter should set both k_bits and v_bits
+        cache = tq.TurboQuantKVCache(bits=3)
+        assert cache.k_bits == 3
+        assert cache.v_bits == 3
+        assert cache.bits == 3  # legacy attribute
