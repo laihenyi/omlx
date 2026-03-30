@@ -23,6 +23,81 @@ from mlx_lm.models.cache import _BaseCache
 
 
 # ---------------------------------------------------------------------------
+# Walsh-Hadamard Transform (replaces QR-based rotation)
+# ---------------------------------------------------------------------------
+
+@lru_cache(maxsize=16)
+def _wht_matrix(dim: int) -> mx.array:
+    """Generate Walsh-Hadamard matrix of size dim x dim.
+
+    Uses Sylvester construction: H_{2n} = [[H_n, H_n], [H_n, -H_n]]
+    Only valid for dim = 2^k.
+    """
+    if dim == 1:
+        return mx.array([[1.0]], dtype=mx.float32)
+
+    # Verify dim is power of 2
+    assert (dim & (dim - 1)) == 0, f"dim must be power of 2, got {dim}"
+
+    # Start with H_1
+    H = mx.array([[1.0]], dtype=mx.float32)
+    n = 1
+
+    while n < dim:
+        # H_{2n} = [[H_n, H_n], [H_n, -H_n]]
+        H_pos = mx.concatenate([H, H], axis=1)
+        H_neg = mx.concatenate([H, -H], axis=1)
+        H = mx.concatenate([H_pos, H_neg], axis=0)
+        n *= 2
+
+    return H.astype(mx.float32)
+
+
+@lru_cache(maxsize=16)
+def _random_sign_flip(dim: int, seed: int) -> mx.array:
+    """Generate random ±1 signs for WHT rotation."""
+    key = mx.random.key(seed)
+    signs = mx.random.bernoulli(p=0.5, shape=(dim,), key=key).astype(mx.float32) * 2 - 1
+    return signs
+
+
+def apply_wht_rotation(vectors: mx.array, seed: int = 0) -> mx.array:
+    """Apply WHT rotation: signs * WHT(vectors) / sqrt(dim).
+
+    Args:
+        vectors: shape (..., D) where D must be power of 2
+        seed: random seed for sign flip
+
+    Returns:
+        Rotated vectors of same shape
+    """
+    dim = vectors.shape[-1]
+    H = _wht_matrix(dim)
+    signs = _random_sign_flip(dim, seed)
+    scale = 1.0 / math.sqrt(dim)
+
+    # Apply: signs * (vectors @ H) * scale
+    rotated = (vectors.astype(mx.float32) @ H) * signs * scale
+    return rotated.astype(vectors.dtype)
+
+
+def apply_wht_inverse(vectors: mx.array, seed: int = 0) -> mx.array:
+    """Apply inverse WHT rotation: WHT(signs * vectors) / sqrt(dim).
+
+    WHT is self-inverse up to scale: WHT(WHT(v)) = dim * v
+    Since forward uses 1/sqrt(dim), inverse also uses 1/sqrt(dim).
+    """
+    dim = vectors.shape[-1]
+    H = _wht_matrix(dim)
+    signs = _random_sign_flip(dim, seed)
+    scale = 1.0 / math.sqrt(dim)
+
+    # Apply: (vectors * signs) @ H * scale
+    restored = (vectors.astype(mx.float32) * signs) @ H * scale
+    return restored.astype(vectors.dtype)
+
+
+# ---------------------------------------------------------------------------
 # Codebook generation (Beta distribution Lloyd-Max quantizer)
 # ---------------------------------------------------------------------------
 
