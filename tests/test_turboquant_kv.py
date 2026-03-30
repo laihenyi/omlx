@@ -3,15 +3,15 @@
 
 import importlib.util
 import math
+from pathlib import Path
 import pytest
 import numpy as np
 import mlx.core as mx
 
 # Import turboquant_kv directly to avoid triggering full omlx package import
-_spec = importlib.util.spec_from_file_location(
-    "turboquant_kv",
-    "/Users/laihenyi/Documents/GitHub/omlx/omlx/turboquant_kv.py"
-)
+# Uses relative path for portability
+_tq_path = Path(__file__).parent.parent / "omlx" / "turboquant_kv.py"
+_spec = importlib.util.spec_from_file_location("turboquant_kv", str(_tq_path))
 tq = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(tq)
 

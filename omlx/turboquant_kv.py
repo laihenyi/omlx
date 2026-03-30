@@ -1089,11 +1089,32 @@ class BatchTurboQuantKVCache(_BaseCache):
     Prefill phase: stores fp16 (like BatchKVCache) for full-quality attention.
     Decode phase: quantizes to TurboQuant for memory-efficient generation.
     Implements all BatchKVCache methods for BatchGenerator compatibility.
+
+    Supports asymmetric K/V compression with separate k_bits and v_bits.
     """
     step = 256
 
-    def __init__(self, left_padding, bits: int = 4, seed: int = 0):
-        self.bits = bits
+    def __init__(
+        self,
+        left_padding,
+        k_bits: int = 4,
+        v_bits: int = 4,
+        sparse_v: bool = True,
+        sparse_v_budget: float = 0.75,
+        seed: int = 0,
+        # Legacy compatibility
+        bits: int = None,
+    ):
+        # Support legacy bits parameter for backward compatibility
+        if bits is not None:
+            self.k_bits = bits
+            self.v_bits = bits
+        else:
+            self.k_bits = k_bits
+            self.v_bits = v_bits
+        self.bits = self.k_bits  # For external access
+        self.sparse_v = sparse_v
+        self.sparse_v_budget = sparse_v_budget
         self.seed = seed
         # Safety: mlx-lm's base.py SDPA checks hasattr(cache, "bits") and then
         # accesses cache.group_size for affine quantized caches.  If our attention
@@ -1107,38 +1128,47 @@ class BatchTurboQuantKVCache(_BaseCache):
         self._idx = 0
         self._right_padding = None
         # Quantized storage (decode phase)
-        self._k_norms = None
+        self._k_scales = None
+        self._k_zeros = None
         self._k_packed = None
-        self._v_norms = None
+        self._v_scales = None
+        self._v_zeros = None
         self._v_packed = None
         self._quantized = False
-        self._codec = None
+        self._k_codec = None
+        self._v_codec = None
 
-    def _ensure_codec(self, dim):
-        if self._codec is None:
-            self._codec = TurboQuantMSECodec(dim, self.bits, self.seed)
+        # Warn for 2-bit mode
+        if self.k_bits == 2 or self.v_bits == 2:
+            logger.warning(
+                "TurboQuant 2-bit mode enabled. Expect ~6.5%% perplexity increase. "
+                "Recommended only for extreme memory constraints."
+            )
+
+    def _ensure_codecs(self, dim):
+        if self._k_codec is None:
+            self._k_codec = PolarQuantCodec(dim, self.k_bits, seed=self.seed)
+        if self._v_codec is None:
+            self._v_codec = PolarQuantCodec(dim, self.v_bits, seed=self.seed)
 
     def _quantize_buffer(self):
         """Convert fp16 KV to quantized. Called at decode start."""
         if self._quantized or self.keys is None:
             return
         B, H, T, D = self.keys.shape
-        logger.info(f"TurboQuant batch: quantizing {self._idx} tokens ({B}×{H} heads, dim={D}) to {self.bits}-bit")
-        self._ensure_codec(D)
+        logger.info(f"TurboQuant batch: quantizing {self._idx} tokens ({B}×{H} heads, dim={D}) to K={self.k_bits}-bit, V={self.v_bits}-bit")
+        self._ensure_codecs(D)
         # Quantize full buffer
         k = self.keys[..., :self._idx, :]
         v = self.values[..., :self._idx, :]
-        k_norms, k_packed = self._codec.quantize(k)
-        v_norms, v_packed = self._codec.quantize(v)
-        pw = _packed_width(D, self.bits)
-        self._k_norms = mx.zeros((B, H, self._idx, ), dtype=mx.float32)
-        self._k_packed = mx.zeros((B, H, self._idx, pw), dtype=mx.uint32)
-        self._v_norms = mx.zeros((B, H, self._idx, ), dtype=mx.float32)
-        self._v_packed = mx.zeros((B, H, self._idx, pw), dtype=mx.uint32)
-        self._k_norms[:] = k_norms
-        self._k_packed[:] = k_packed
-        self._v_norms[:] = v_norms
-        self._v_packed[:] = v_packed
+        k_scales, k_zeros, k_packed = self._k_codec.quantize(k)
+        v_scales, v_zeros, v_packed = self._v_codec.quantize(v)
+        self._k_scales = k_scales
+        self._k_zeros = k_zeros
+        self._k_packed = k_packed
+        self._v_scales = v_scales
+        self._v_zeros = v_zeros
+        self._v_packed = v_packed
         self._quantized = True
         # Free fp16
         self.keys = None

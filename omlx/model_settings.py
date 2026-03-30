@@ -80,6 +80,21 @@ class ModelSettings:
     display_name: Optional[str] = None
     description: Optional[str] = None
 
+    def __post_init__(self):
+        """Validate TurboQuant+ settings."""
+        if self.turboquant_k_bits not in {2, 3, 4}:
+            raise ValueError(
+                f"turboquant_k_bits must be 2, 3, or 4, got {self.turboquant_k_bits}"
+            )
+        if self.turboquant_v_bits not in {2, 3, 4}:
+            raise ValueError(
+                f"turboquant_v_bits must be 2, 3, or 4, got {self.turboquant_v_bits}"
+            )
+        if not (0.5 <= self.turboquant_sparse_v_budget <= 1.0):
+            raise ValueError(
+                f"turboquant_sparse_v_budget must be 0.5-1.0, got {self.turboquant_sparse_v_budget}"
+            )
+
     def to_dict(self) -> dict:
         """Convert to dictionary, excluding None values.
 
