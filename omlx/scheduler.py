@@ -126,7 +126,11 @@ class _BoundarySnapshotBatchGenerator(BatchGenerator):
         self._boundary_block_size = max(0, int(boundary_block_size))
         self._prefill_boundary_callback = prefill_boundary_callback
         self._abort_check_callback = abort_check_callback
-        self._turboquant_kv_bits: Optional[float] = None  # Set by Scheduler if enabled
+        # TurboQuant+ settings (asymmetric K/V bits, sparse V)
+        self._turboquant_k_bits: Optional[int] = None
+        self._turboquant_v_bits: Optional[int] = None
+        self._turboquant_sparse_v: bool = True
+        self._turboquant_sparse_v_budget: float = 0.75
         # Memory limits for inline prefill checking (set by Scheduler).
         # mx.get_active_memory() is ~20ns, negligible vs ~5s prefill chunks.
         self._memory_limit_bytes: int = 0  # soft limit, 0 = disabled
@@ -147,16 +151,30 @@ class _BoundarySnapshotBatchGenerator(BatchGenerator):
         from mlx_lm.models.cache import KVCache, CacheList
 
         converted = 0
+        k_bits = self._turboquant_k_bits
+        v_bits = self._turboquant_v_bits
+        sparse_v = self._turboquant_sparse_v
+        sparse_v_budget = self._turboquant_sparse_v_budget
 
-        bits = int(self._turboquant_kv_bits)
         for i, cache_obj in enumerate(prompt_cache):
             cls_name = type(cache_obj).__name__
             if cls_name == "BatchKVCache":
                 left_padding = cache_obj.left_padding.tolist()
-                prompt_cache[i] = BatchTurboQuantKVCache(left_padding, bits=bits)
+                prompt_cache[i] = BatchTurboQuantKVCache(
+                    left_padding,
+                    k_bits=k_bits,
+                    v_bits=v_bits,
+                    sparse_v=sparse_v,
+                    sparse_v_budget=sparse_v_budget,
+                )
                 converted += 1
             elif isinstance(cache_obj, KVCache):
-                prompt_cache[i] = TurboQuantKVCache(bits=bits)
+                prompt_cache[i] = TurboQuantKVCache(
+                    k_bits=k_bits,
+                    v_bits=v_bits,
+                    sparse_v=sparse_v,
+                    sparse_v_budget=sparse_v_budget,
+                )
                 converted += 1
             elif isinstance(cache_obj, CacheList):
                 new_caches = []
@@ -164,16 +182,34 @@ class _BoundarySnapshotBatchGenerator(BatchGenerator):
                     c_name = type(c).__name__
                     if c_name == "BatchKVCache":
                         left_padding = c.left_padding.tolist()
-                        new_caches.append(BatchTurboQuantKVCache(left_padding, bits=bits))
+                        new_caches.append(
+                            BatchTurboQuantKVCache(
+                                left_padding,
+                                k_bits=k_bits,
+                                v_bits=v_bits,
+                                sparse_v=sparse_v,
+                                sparse_v_budget=sparse_v_budget,
+                            )
+                        )
                         converted += 1
                     elif isinstance(c, KVCache):
-                        new_caches.append(TurboQuantKVCache(bits=bits))
+                        new_caches.append(
+                            TurboQuantKVCache(
+                                k_bits=k_bits,
+                                v_bits=v_bits,
+                                sparse_v=sparse_v,
+                                sparse_v_budget=sparse_v_budget,
+                            )
+                        )
                         converted += 1
                     else:
                         new_caches.append(c)
                 cache_obj.caches = tuple(new_caches)
         if converted > 0:
-            logger.info(f"TurboQuant: converted {converted}/{len(prompt_cache)} cache layers to {bits}-bit")
+            logger.info(
+                f"TurboQuant+: converted {converted}/{len(prompt_cache)} cache layers "
+                f"to k={k_bits}-bit v={v_bits}-bit sparse_v={sparse_v}"
+            )
 
     def _boundary_capture_enabled(self) -> bool:
         return (
@@ -453,7 +489,7 @@ class _BoundarySnapshotBatchGenerator(BatchGenerator):
             prompt_cache = _make_cache(self.model, padding, self.max_kv_size)
 
             # TurboQuant KV cache: convert KVCache layers to TurboQuantKVCache
-            if self._turboquant_kv_bits is not None:
+            if self._turboquant_k_bits is not None:
                 self._apply_turboquant_kv(prompt_cache)
 
             # Build left-padded VLM embeddings batch (matching token padding).
@@ -1073,8 +1109,11 @@ class Scheduler:
         # size to reduce boundary snapshot overhead during prefill.
         self._enlarge_block_size_for_arrays_cache()
 
-        # TurboQuant KV cache (set by engine if model_settings has it enabled)
-        self._turboquant_kv_bits: Optional[float] = None
+        # TurboQuant+ settings (asymmetric K/V bits, sparse V)
+        self._turboquant_k_bits: Optional[int] = None
+        self._turboquant_v_bits: Optional[int] = None
+        self._turboquant_sparse_v: bool = True
+        self._turboquant_sparse_v_budget: float = 0.75
 
         # Request management - following vLLM's design
         self.waiting: deque[Request] = deque()  # Waiting queue (FCFS)
@@ -1626,9 +1665,12 @@ class Scheduler:
         bg._memory_limit_bytes = self._memory_limit_bytes
         bg._memory_hard_limit_bytes = self._memory_hard_limit_bytes
 
-        # TurboQuant KV cache: propagate bits setting from Scheduler config
-        if hasattr(self, "_turboquant_kv_bits") and self._turboquant_kv_bits is not None:
-            bg._turboquant_kv_bits = self._turboquant_kv_bits
+        # TurboQuant+ settings: propagate from Scheduler config
+        if hasattr(self, "_turboquant_k_bits") and self._turboquant_k_bits is not None:
+            bg._turboquant_k_bits = self._turboquant_k_bits
+            bg._turboquant_v_bits = self._turboquant_v_bits
+            bg._turboquant_sparse_v = self._turboquant_sparse_v
+            bg._turboquant_sparse_v_budget = self._turboquant_sparse_v_budget
 
         return bg
 
