@@ -30,7 +30,7 @@ from mlx_lm.generate import (
     _right_pad_prompts,
     generation_stream,
 )
-from mlx_lm.sample_utils import make_sampler, make_logits_processors, make_presence_penalty
+from mlx_lm.sample_utils import make_sampler, make_logits_processors
 
 from pathlib import Path
 
@@ -1626,16 +1626,10 @@ class Scheduler:
             top_k=sampling_params.top_k,
         )
 
-        # Create logits processors for repetition/presence/frequency penalties
+        # Create logits processors for repetition penalty
         logits_processors = make_logits_processors(
             repetition_penalty=sampling_params.repetition_penalty
             if sampling_params.repetition_penalty != 1.0
-            else None,
-            presence_penalty=sampling_params.presence_penalty
-            if sampling_params.presence_penalty != 0.0
-            else None,
-            frequency_penalty=sampling_params.frequency_penalty
-            if sampling_params.frequency_penalty != 0.0
             else None,
         )
 
@@ -1715,12 +1709,6 @@ class Scheduler:
         logits_processors = make_logits_processors(
             repetition_penalty=sampling_params.repetition_penalty
             if sampling_params.repetition_penalty != 1.0
-            else None,
-            presence_penalty=sampling_params.presence_penalty
-            if sampling_params.presence_penalty != 0.0
-            else None,
-            frequency_penalty=sampling_params.frequency_penalty
-            if sampling_params.frequency_penalty != 0.0
             else None,
         )
 
