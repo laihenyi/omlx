@@ -94,8 +94,11 @@ class ModelSettingsRequest(BaseModel):
     thinking_budget_enabled: Optional[bool] = None
     thinking_budget_tokens: Optional[int] = None
     # TurboQuant KV cache (experimental)
-    turboquant_kv_enabled: Optional[bool] = None
-    turboquant_kv_bits: Optional[int] = None
+    turboquant_enabled: Optional[bool] = None
+    turboquant_k_bits: Optional[int] = None
+    turboquant_v_bits: Optional[int] = None
+    turboquant_sparse_v: Optional[bool] = None
+    turboquant_sparse_v_budget: Optional[float] = None
     # SpecPrefill (experimental)
     specprefill_enabled: Optional[bool] = None
     specprefill_draft_model: Optional[str] = None
@@ -1313,8 +1316,11 @@ async def list_models(is_admin: bool = Depends(require_admin)):
                 "forced_ct_kwargs": settings.forced_ct_kwargs,
                 "ttl_seconds": settings.ttl_seconds,
                 "index_cache_freq": settings.index_cache_freq,
-                "turboquant_kv_enabled": settings.turboquant_kv_enabled,
-                "turboquant_kv_bits": settings.turboquant_kv_bits,
+                "turboquant_enabled": settings.turboquant_enabled,
+                "turboquant_k_bits": settings.turboquant_k_bits,
+                "turboquant_v_bits": settings.turboquant_v_bits,
+                "turboquant_sparse_v": settings.turboquant_sparse_v,
+                "turboquant_sparse_v_budget": settings.turboquant_sparse_v_budget,
                 "specprefill_enabled": settings.specprefill_enabled,
                 "specprefill_draft_model": settings.specprefill_draft_model,
                 "specprefill_keep_pct": settings.specprefill_keep_pct,
@@ -1520,10 +1526,16 @@ async def update_model_settings(
             else None
         )
     # TurboQuant KV cache settings
-    if "turboquant_kv_enabled" in sent:
-        current_settings.turboquant_kv_enabled = request.turboquant_kv_enabled or False
-    if "turboquant_kv_bits" in sent:
-        current_settings.turboquant_kv_bits = request.turboquant_kv_bits or 4
+    if "turboquant_enabled" in sent:
+        current_settings.turboquant_enabled = request.turboquant_enabled or False
+    if "turboquant_k_bits" in sent:
+        current_settings.turboquant_k_bits = request.turboquant_k_bits or 4
+    if "turboquant_v_bits" in sent:
+        current_settings.turboquant_v_bits = request.turboquant_v_bits or 4
+    if "turboquant_sparse_v" in sent:
+        current_settings.turboquant_sparse_v = request.turboquant_sparse_v or True
+    if "turboquant_sparse_v_budget" in sent:
+        current_settings.turboquant_sparse_v_budget = request.turboquant_sparse_v_budget or 0.75
     # SpecPrefill settings
     if "specprefill_enabled" in sent:
         current_settings.specprefill_enabled = request.specprefill_enabled or False
