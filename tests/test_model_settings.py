@@ -454,3 +454,37 @@ class TestModelSettingsManager:
                 t.join()
 
             assert len(errors) == 0
+
+
+class TestTurboQuantSettings:
+    """Tests for TurboQuant+ settings."""
+
+    def test_turboquant_settings_fields(self):
+        """Test new TurboQuant+ settings fields exist."""
+        settings = ModelSettings(
+            turboquant_enabled=True,
+            turboquant_k_bits=3,
+            turboquant_v_bits=4,
+            turboquant_sparse_v=True,
+            turboquant_sparse_v_budget=0.8,
+        )
+        assert settings.turboquant_enabled is True
+        assert settings.turboquant_k_bits == 3
+        assert settings.turboquant_v_bits == 4
+        assert settings.turboquant_sparse_v is True
+        assert settings.turboquant_sparse_v_budget == 0.8
+
+    def test_turboquant_defaults(self):
+        """Test TurboQuant+ default values."""
+        settings = ModelSettings()
+        assert settings.turboquant_enabled is False
+        assert settings.turboquant_k_bits == 4
+        assert settings.turboquant_v_bits == 4
+        assert settings.turboquant_sparse_v is True
+        assert settings.turboquant_sparse_v_budget == 0.75
+
+    def test_turboquant_legacy_removed(self):
+        """Test that legacy settings are removed."""
+        settings = ModelSettings()
+        assert not hasattr(settings, "turboquant_kv_enabled")
+        assert not hasattr(settings, "turboquant_kv_bits")

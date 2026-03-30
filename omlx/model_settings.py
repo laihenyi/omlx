@@ -36,6 +36,9 @@ class ModelSettings:
         description: Optional description of the model.
     """
 
+    # Default system prompt injected when request has no system message
+    default_system_prompt: Optional[str] = None
+
     # Sampling parameters (None means use global default)
     max_context_window: Optional[int] = None
     max_tokens: Optional[int] = None
@@ -56,9 +59,12 @@ class ModelSettings:
     thinking_budget_enabled: bool = False
     thinking_budget_tokens: Optional[int] = None
 
-    # TurboQuant KV cache (experimental: vector quantization for KV cache compression)
-    turboquant_kv_enabled: bool = False
-    turboquant_kv_bits: int = 4  # 3 or 4
+    # TurboQuant+ KV cache compression
+    turboquant_enabled: bool = False
+    turboquant_k_bits: int = 4  # 2, 3, or 4
+    turboquant_v_bits: int = 4  # 2, 3, or 4 (asymmetric K/V)
+    turboquant_sparse_v: bool = True  # Sparse V Decoding (skip low-weight V)
+    turboquant_sparse_v_budget: float = 0.75  # Top-75% attention mass retained
 
     # SpecPrefill (experimental: attention-based sparse prefill for MoE models)
     specprefill_enabled: bool = False
