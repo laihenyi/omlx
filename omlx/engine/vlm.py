@@ -268,13 +268,19 @@ class VLMBatchedEngine(BaseEngine):
 
         # TurboQuant KV cache
         if self._model_settings is not None:
-            tq_enabled = getattr(self._model_settings, "turboquant_kv_enabled", False)
+            tq_enabled = getattr(self._model_settings, "turboquant_enabled", False)
             if tq_enabled:
                 from ..patches.turboquant_attention import apply_turboquant_attention_patch
                 apply_turboquant_attention_patch()
-                tq_bits = int(getattr(self._model_settings, "turboquant_kv_bits", 4))
-                self._engine.engine.scheduler._turboquant_kv_bits = tq_bits
-                logger.info(f"TurboQuant KV cache enabled for VLM: {tq_bits} bits")
+                k_bits = int(getattr(self._model_settings, "turboquant_k_bits", 4))
+                v_bits = int(getattr(self._model_settings, "turboquant_v_bits", 4))
+                sparse_v = getattr(self._model_settings, "turboquant_sparse_v", True)
+                sparse_v_budget = getattr(self._model_settings, "turboquant_sparse_v_budget", 0.75)
+                self._engine.engine.scheduler._turboquant_k_bits = k_bits
+                self._engine.engine.scheduler._turboquant_v_bits = v_bits
+                self._engine.engine.scheduler._turboquant_sparse_v = sparse_v
+                self._engine.engine.scheduler._turboquant_sparse_v_budget = sparse_v_budget
+                logger.info(f"TurboQuant+ enabled for VLM: K={k_bits} bits, V={v_bits} bits, sparse_V={sparse_v} (budget={sparse_v_budget})")
 
         # SpecPrefill: load draft model and pass to scheduler
         if self._model_settings is not None:
