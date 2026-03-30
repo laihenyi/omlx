@@ -98,6 +98,114 @@ def apply_wht_inverse(vectors: mx.array, seed: int = 0) -> mx.array:
 
 
 # ---------------------------------------------------------------------------
+# PolarQuant: per-group min/max quantization
+# ---------------------------------------------------------------------------
+
+class PolarQuantCodec:
+    """Polar quantization codec with WHT rotation.
+
+    Replaces Beta-Lloyd-Max codebook with simpler min/max uniform quantization.
+    """
+
+    def __init__(self, dim: int, bits: int, group_size: int = None, seed: int = 0):
+        self.dim = dim
+        self.bits = bits
+        self.seed = seed
+        # Smaller groups for lower bits to maintain quality
+        self.group_size = group_size if group_size else (32 if bits <= 2 else 64)
+        self.n_levels = 1 << bits
+        self._pw = _packed_width(self.group_size, bits)
+
+    def quantize(self, vectors: mx.array) -> tuple:
+        """Quantize vectors to packed format.
+
+        Args:
+            vectors: shape (B, H, T, D)
+
+        Returns:
+            (scales, zeros, packed) where packed is uint32
+        """
+        # 1. Apply WHT rotation for Gaussianization
+        rotated = apply_wht_rotation(vectors, self.seed)
+
+        # 2. Reshape into groups
+        shape = rotated.shape
+        D = shape[-1]
+        n_groups = D // self.group_size
+        grouped = rotated.reshape(*shape[:-1], n_groups, self.group_size)
+
+        # 3. Per-group min/max
+        g_min = grouped.min(axis=-1, keepdims=True)
+        g_max = grouped.max(axis=-1, keepdims=True)
+
+        # 4. Uniform quantization
+        range_val = g_max - g_min
+        range_val = mx.maximum(range_val, 1e-10)  # Avoid div by 0
+        scale = range_val / (self.n_levels - 1)
+
+        indices = ((grouped - g_min) / scale)
+        indices = mx.clip(indices.astype(mx.uint32), 0, self.n_levels - 1)
+
+        # 5. Pack each group
+        # indices shape: (B, H, T, n_groups, group_size)
+        packed_groups = []
+        for g in range(n_groups):
+            group_indices = indices[..., g, :]  # (B, H, T, group_size)
+            packed_group = _pack_contiguous(group_indices, self.bits, self.group_size)
+            packed_groups.append(packed_group[..., None, :])  # Add n_groups dim
+
+        # Concatenate along n_groups axis: (B, H, T, n_groups, pw)
+        packed = mx.concatenate(packed_groups, axis=-2)
+
+        return (
+            scale.squeeze(-1).astype(mx.float16),  # (B, H, T, n_groups)
+            g_min.squeeze(-1).astype(mx.float16),  # (B, H, T, n_groups)
+            packed,  # (B, H, T, n_groups, pw)
+        )
+
+    def dequantize(
+        self,
+        scales: mx.array,
+        zeros: mx.array,
+        packed: mx.array
+    ) -> mx.array:
+        """Dequantize packed data back to vectors.
+
+        Args:
+            scales: shape (B, H, T, n_groups)
+            zeros: shape (B, H, T, n_groups)
+            packed: shape (B, H, T, n_groups, pw)
+
+        Returns:
+            vectors: shape (B, H, T, D)
+        """
+        shape = packed.shape
+        B, H, T, n_groups, pw = shape
+
+        # Unpack each group
+        unpacked_groups = []
+        for g in range(n_groups):
+            group_packed = packed[..., g, :]  # (B, H, T, pw)
+            unpacked = _unpack_contiguous(group_packed, self.bits, self.group_size)
+            unpacked_groups.append(unpacked[..., None, :])  # Add n_groups dim
+
+        # Concatenate along n_groups axis: (B, H, T, n_groups, group_size)
+        indices = mx.concatenate(unpacked_groups, axis=-2)
+
+        # Scale back
+        values = zeros[..., None] + indices.astype(scales.dtype) * scales[..., None]
+        # values shape: (B, H, T, n_groups, group_size)
+
+        # Flatten groups
+        restored = values.reshape(B, H, T, -1)
+
+        # Apply inverse WHT
+        restored = apply_wht_inverse(restored, self.seed)
+
+        return restored
+
+
+# ---------------------------------------------------------------------------
 # Codebook generation (Beta distribution Lloyd-Max quantizer)
 # ---------------------------------------------------------------------------
 
